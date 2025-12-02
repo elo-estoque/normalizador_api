@@ -7,12 +7,12 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-# --- LOGGING PARA DEBUG (Aparece nos logs do Dokploy) ---
+# --- LOGGING PARA DEBUG ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURAÇÃO DA API ---
-app = FastAPI(title="ELO-Normalizador API", description="API do Robô Blindado 3.4")
+app = FastAPI(title="ELO-Normalizador API", description="API do Robô Blindado 3.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -102,13 +102,18 @@ def processar_dataframe(df, col_map):
     df = df.copy()
     df['ID_Personalizado'] = [f'ID_{i+1}' for i in range(len(df))]
     
-    df['Nome_Final'] = df[col_map['nome']] if col_map.get('nome') else ""
-    df['Cidade_Final'] = df[col_map['cidade']] if col_map.get('cidade') else ""
-    df['UF_Final'] = df[col_map['uf']] if col_map.get('uf') else ""
-    df['Regiao_Final'] = df[col_map['regiao']] if col_map.get('regiao') else ""
-    df['Bairro_Final'] = df[col_map['bairro']] if col_map.get('bairro') else "" 
+    # Mapeamento seguro (se a coluna não existir, preenche com vazio)
+    df['Nome_Final'] = df[col_map['nome']] if col_map.get('nome') and col_map['nome'] in df.columns else ""
+    df['Cidade_Final'] = df[col_map['cidade']] if col_map.get('cidade') and col_map['cidade'] in df.columns else ""
+    df['UF_Final'] = df[col_map['uf']] if col_map.get('uf') and col_map['uf'] in df.columns else ""
+    df['Regiao_Final'] = df[col_map['regiao']] if col_map.get('regiao') and col_map['regiao'] in df.columns else ""
+    df['Bairro_Final'] = df[col_map['bairro']] if col_map.get('bairro') and col_map['bairro'] in df.columns else "" 
     
-    col_endereco = col_map['endereco']
+    # Endereço é obrigatório, mas vamos garantir que não quebre
+    col_endereco = col_map.get('endereco')
+    if not col_endereco or col_endereco not in df.columns:
+        # Tenta achar a primeira coluna se não achou nada
+        col_endereco = df.columns[0]
     
     df[col_endereco] = df[col_endereco].astype(str)
     df['CEP_Final'] = df[col_endereco].apply(extrair_cep_bruto)
@@ -135,7 +140,7 @@ def processar_dataframe(df, col_map):
 
     df['Logradouro_Final'] = df.apply(limpar_texto, axis=1)
     df['Complemento_Final'] = ""
-    df['Aos_Cuidados_Final'] = ""
+    df['Aos_Cuidados_Final'] = "" # Campo placeholder
     df['STATUS_SISTEMA'] = df.apply(lambda x: gerar_status(x['CEP_Final'], x['Numero_Final']), axis=1)
     
     df = df.sort_values(by=['STATUS_SISTEMA'], ascending=False)
@@ -146,12 +151,12 @@ def processar_dataframe(df, col_map):
 @app.get("/")
 def health_check():
     logger.info("Health check chamado!")
-    return {"status": "online", "robot": "Blindado 3.4"}
+    return {"status": "online", "robot": "Blindado 3.5"}
 
 @app.post("/analisar_colunas")
 async def analisar_arquivo(file: UploadFile = File(...)):
-    if not file.filename.endswith('.xlsx'):
-        raise HTTPException(status_code=400, detail="Apenas arquivos .xlsx são permitidos")
+    if not file.filename.endswith(('.xlsx', '.xls')):
+        raise HTTPException(status_code=400, detail="Apenas arquivos Excel (.xlsx, .xls) são permitidos")
     
     try:
         contents = await file.read()
@@ -172,6 +177,57 @@ async def analisar_arquivo(file: UploadFile = File(...)):
         logger.error(f"Erro ao analisar: {e}")
         raise HTTPException(status_code=500, detail=f"Erro ao ler arquivo: {str(e)}")
 
+# --- NOVO ENDPOINT: PREVIEW PARA IMPORTAÇÃO JSON ---
+@app.post("/preview_importacao")
+async def preview_importacao(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        df = pd.read_excel(io.BytesIO(contents))
+        df = df.astype(str).replace('nan', '')
+        cols = [str(c) for c in df.columns]
+
+        # Lógica de Auto-Mapping (Tenta adivinhar as colunas sozinho)
+        mapa_auto = {
+            "endereco": next((c for c in cols if any(x in c.lower() for x in ['endereço', 'endereco', 'logradouro', 'rua'])), cols[0] if cols else None),
+            "nome": next((c for c in cols if any(x in c.lower() for x in ['nome', 'clube', 'loja', 'cliente', 'destinatario'])), ""),
+            "cidade": next((c for c in cols if any(x in c.lower() for x in ['cidade', 'city', 'municipio'])), ""),
+            "uf": next((c for c in cols if any(x in c.lower() for x in ['uf', 'estado'])), ""),
+            "bairro": next((c for c in cols if any(x in c.lower() for x in ['bairro'])), ""),
+            "regiao": next((c for c in cols if any(x in c.lower() for x in ['regiao'])), "")
+        }
+
+        # Processa os dados
+        df_processado = processar_dataframe(df, mapa_auto)
+
+        # Monta a LISTA JSON que o Frontend espera
+        resultado = []
+        for _, row in df_processado.iterrows():
+            # Define o 'A/C' (Aos cuidados): Tenta usar Nome, senão vazio
+            apelido = row['Nome_Final'] if row['Nome_Final'] else "Cliente"
+            
+            # Recupera o endereço original para salvar no histórico
+            col_orig = mapa_auto.get('endereco')
+            endereco_full = row[col_orig] if col_orig in row else ""
+
+            resultado.append({
+                "status": row['STATUS_SISTEMA'],
+                "apelido_local": apelido,
+                "cep": row['CEP_Final'],
+                "logradouro": row['Logradouro_Final'],
+                "numero": row['Numero_Final'],
+                "bairro": row['Bairro_Final'],
+                "cidade": row['Cidade_Final'],
+                "estado": row['UF_Final'],
+                "complemento": row['Complemento_Final'],
+                "fullAddress": endereco_full
+            })
+
+        return resultado
+
+    except Exception as e:
+        logger.error(f"Erro no preview: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro ao processar preview: {str(e)}")
+
 @app.post("/processar")
 async def processar(
     tipo_saida: str = Form(...),
@@ -190,6 +246,8 @@ async def processar(
         df_processado = processar_dataframe(df, col_map)
         output = io.BytesIO()
         
+        filename = "Processado.xlsx"
+
         if tipo_saida == 'triagem':
             cols_to_show = [
                 "STATUS_SISTEMA", "ID_Personalizado", "Nome_Final", "CEP_Final", 

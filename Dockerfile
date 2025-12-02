@@ -19,4 +19,4 @@ COPY . .
 
 # 6. Comando para iniciar o servidor Gunicorn
 # Ele executa o Gunicorn e o vincula ao host 0.0.0.0 e à porta 8000
-CMD ["gunicorn", "normalizador_api:app", "--bind", "0.0.0.0:8000"]
+CMD ["gunicorn", "normalizador_api:app", "--workers", "1", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000"]

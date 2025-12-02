@@ -1,45 +1,68 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+import streamlit as st
 import pandas as pd
-import io
 import re
-import unicodedata
+import io
 
-# ==========================================================
-# FUNÇÕES CORE (LÓGICA ROBUSTA DO APP.PY)
-# ==========================================================
+# Configuração da página
+st.set_page_config(page_title="Normalizador de Endereços", layout="wide")
 
-def remover_acentos(txt):
-    if not isinstance(txt, str): return str(txt)
-    return unicodedata.normalize('NFKD', txt).encode('ASCII', 'ignore').decode('ASCII')
+# Título
+st.title("🚚 ELO-Normalizador Automático de Endereços (CEP + Layout Final)")
+st.markdown("Faça upload da sua planilha para separar Logradouro, Número, Bairro, Cidade, UF e gerar o CEP formatado.")
 
-def extrair_cep_bruto(texto):
-    if not isinstance(texto, str): return None
-    texto_limpo = texto.replace('"', '').replace("'", "").strip()
-    # Padrão 1: CEP Formatado
-    match_formatado = re.search(r'\b\d{2}[. ]?\d{3}-\d{3}\b', texto_limpo)
-    if match_formatado: return re.sub(r'\D', '', match_formatado.group(0))
-    # Padrão 2: Palavra CEP
-    match_palavra = re.search(r'(?:CEP|C\.E\.P).{0,5}?(\d{8})', re.sub(r'[-.]', '', texto_limpo), re.IGNORECASE)
-    if match_palavra: return match_palavra.group(1)
-    # Padrão 3: 8 digitos soltos
-    match_8_digitos = re.search(r'(?<!\d)(\d{8})(?!\d)', texto_limpo)
-    if match_8_digitos: return match_8_digitos.group(1)
-    # Padrão 4: 7 digitos (erro comum)
-    match_7_digitos = re.search(r'(?<!\d)(\d{7})(?!\d)', texto_limpo)
-    if match_7_digitos: return "0" + match_7_digitos.group(1)
+# --- FUNÇÕES DE EXTRAÇÃO (REGEX) ---
+
+def limpar_texto(texto):
+    if not isinstance(texto, str):
+        return str(texto)
+    return texto.strip()
+
+def extrair_cep(texto):
+    if not isinstance(texto, str):
+        return None
+    
+    # Padrão 1: CEP com hífen (ex: 05415-050)
+    match_com_hifen = re.search(r'\b\d{5}-\d{3}\b', texto)
+    if match_com_hifen:
+        return match_com_hifen.group(0)
+    
+    # Padrão 2: CEP sem hífen (8 dígitos seguidos) - ex: 05415050
+    # Evita pegar telefones ou CNPJ filtrando sequências maiores
+    match_sem_hifen = re.search(r'\b\d{8}\b', texto)
+    if match_sem_hifen:
+        cep = match_sem_hifen.group(0)
+        return f"{cep[:5]}-{cep[5:]}"
+    
     return None
-
-def formatar_cep(cep_bruto):
-    if not cep_bruto or len(cep_bruto) != 8:
-        return ""
-    return f"{cep_bruto[:5]}-{cep_bruto[5:]}"
 
 def extrair_uf(texto):
     if not isinstance(texto, str): return ''
+    # Procura por UF no final da string ou isolada (ex: /SP, - SP, ou SP no fim)
     match = re.search(r'\b([A-Z]{2})\b$', texto.strip())
-    if match: return match.group(1)
+    if match:
+        return match.group(1)
     return ''
+
+def extrair_numero(texto):
+    if not isinstance(texto, str): return ''
+    # Tenta achar "nº 123", "n 123", ", 123" ou número isolado que não seja CEP
+    # Remove o CEP da string antes de buscar o número para não confundir
+    cep = extrair_cep(texto)
+    temp_text = texto
+    if cep:
+        temp_text = texto.replace(cep, '').replace(cep.replace('-', ''), '')
+    
+    # Procura padrão de número
+    match = re.search(r'(?:nº|n°|num|numero|número|n\.|,)\s*(\d+)', temp_text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    
+    # Tenta pegar número isolado no fim da string (ex: Rua Tal, 123)
+    match_fim = re.search(r'\b(\d+)\s*$', temp_text)
+    if match_fim:
+        return match_fim.group(1)
+    
+    return "S/N"
 
 def classificar_regiao(uf):
     sul = ['RS', 'SC', 'PR']
@@ -47,218 +70,216 @@ def classificar_regiao(uf):
     centro_oeste = ['MT', 'MS', 'GO', 'DF']
     nordeste = ['BA', 'PI', 'MA', 'CE', 'RN', 'PB', 'PE', 'AL', 'SE']
     norte = ['AC', 'RO', 'AM', 'RR', 'PA', 'AP', 'TO']
-    uf = str(uf).upper().strip()
+    
+    uf = uf.upper().strip()
     if uf in sul: return 'Sul'
     if uf in sudeste: return 'Sudeste'
     if uf in centro_oeste: return 'Centro-Oeste'
     if uf in nordeste: return 'Nordeste'
     if uf in norte: return 'Norte'
-    return ''
+    return 'Indefinido'
 
-def extrair_numero_inteligente(texto):
-    if not isinstance(texto, str): return ""
-    texto_upper = texto.upper().replace('"', '').strip()
-    
-    # LISTA COMPLETA DE PROIBIÇÕES (A mesma do app.py que funciona bem)
-    lista_proibida = [
-        r'APTO', r'APT', r'AP', r'APARTAMENTO', r'APART',  r'LOTE', r'LT', r'LOT',
-        r'CASA', r'CS', r'CN', r'BLOCO', r'BL', r'SALA', r'SL', r'CJ', r'CONJUNTO',
-        r'LOJA', r'LJ', r'ANDAR', r'AND', r'UNIDADE', r'UNID', r'FRENTE', r'FD', 
-        r'FUNDOS', r'FDS', r'QD', r'QUADRA', r'BOX', r'GARAGEM', r'KM'
-    ]
-    regex_proibidos = r'\b(?:' + '|'.join(lista_proibida) + r')\.?\s*\d+[A-Z]?\b'
-    texto_upper = re.sub(regex_proibidos, '', texto_upper, flags=re.IGNORECASE)
-    
-    # Remove CEPs
-    texto_upper = re.sub(r'\b\d{5}[-.]?\d{3}\b', '', texto_upper)
-    texto_limpo_numeros = re.sub(r'\d{7,}', '', texto_upper)
-    
-    def eh_valido(n): return len(n) <= 6
-    
-    # Lógica de extração
-    if re.search(r'\b(S/N|SN|S\.N|SEM N|S-N)\b', texto_limpo_numeros): return "S/N"
-    
-    match_antes_virgula = re.search(r'\b(\d+)\s*,', texto_limpo_numeros)
-    if match_antes_virgula and eh_valido(match_antes_virgula.group(1)): return match_antes_virgula.group(1)
-    
-    match_hifen = re.search(r'\s[-–]\s*(\d+)\s*(?:[-–]|$)', texto_limpo_numeros)
-    if match_hifen and eh_valido(match_hifen.group(1)): return match_hifen.group(1)
-    
-    match_meio = re.search(r',\s*(\d+)\s*(?:-|,|;|/|AP|BL)', texto_limpo_numeros)
-    if match_meio and eh_valido(match_meio.group(1)): return match_meio.group(1)
-    
-    match_n = re.search(r'(?:nº|n|num)\.?\s*(\d+)', texto_limpo_numeros, re.IGNORECASE)
-    if match_n and eh_valido(match_n.group(1)): return match_n.group(1)
-    
-    match_virgula = re.search(r',\s*(\d+)', texto_limpo_numeros)
-    if match_virgula and eh_valido(match_virgula.group(1)): return match_virgula.group(1)
-    
-    match_fim = re.search(r'\s(\d+)$', texto_limpo_numeros)
-    if match_fim and eh_valido(match_fim.group(1)): return match_fim.group(1)
-    
-    numeros_soltos = re.findall(r'\d+', texto_limpo_numeros)
-    for n in numeros_soltos:
-        if eh_valido(n): return n
-    return ""
+# --- FUNÇÃO PRINCIPAL DE PROCESSAMENTO ---
 
-def gerar_status(cep, numero):
-    status = []
-    if not cep: status.append("FALTA CEP") 
-    if not numero: status.append("FALTA NÚMERO")
-    elif numero == "S/N": status.append("S/N (Manual)")
-    
-    if not status: return "OK"
-    return " ".join(status)
-
-# --- DETECÇÃO AUTOMÁTICA (Necessária pq a API não tem interface de seleção) ---
-def detectar_colunas(df):
-    col_map = {'endereco': None, 'ac': None}
-    cols_norm = {c: remover_acentos(str(c)).lower().strip() for c in df.columns}
-    
-    keywords_end = ['endereco', 'logradouro', 'rua', 'address', 'local', 'entrega', 'destino']
-    keywords_ac = ['a/c', 'aos cuidados', 'destinatario', 'nome', 'cliente', 'recebedor']
-
-    for key in keywords_end:
-        for original, norm in cols_norm.items():
-            if key in norm:
-                col_map['endereco'] = original
-                break
-        if col_map['endereco']: break
-        
-    for key in keywords_ac:
-        for original, norm in cols_norm.items():
-            if key in norm:
-                col_map['ac'] = original
-                break
-        if col_map['ac']: break
-        
-    return col_map
-
-def processar_planilha_api(df):
+def processar_planilha(df, col_endereco, col_nome, col_ac):
     df = df.copy()
     
-    # 1. Filtra linhas vazias (CORREÇÃO DO PROBLEMA DAS 1000 LINHAS)
-    df.dropna(how='all', inplace=True)
+    # 1. Normalizar Endereço Original
+    df['Endereço Original'] = df[col_endereco].apply(limpar_texto)
     
-    # 2. Detecção de colunas
-    mapa = detectar_colunas(df)
-    col_end = mapa['endereco'] or df.columns[0] # Fallback: primeira coluna
-    col_ac = mapa['ac'] or 'A/C (Não detectado)'
+    # 2. Extrair CEP
+    df['CEP_Final'] = df['Endereço Original'].apply(extrair_cep)
     
-    if col_ac not in df.columns:
-        df[col_ac] = '' # Cria vazia se não achar
-
-    # Renomeia para facilitar
-    df.rename(columns={col_end: 'Endereço Original', col_ac: 'A/C_Final'}, inplace=True)
-    
-    # Garante string
-    df['Endereço Original'] = df['Endereço Original'].astype(str).replace('nan', '')
-    df['A/C_Final'] = df['A/C_Final'].astype(str).replace('nan', '')
-    
-    # Filtro extra para remover linhas onde o endereço ficou vazio após conversão
-    df = df[df['Endereço Original'].str.strip() != '']
-
-    # 3. Extrações (USANDO A LÓGICA FORTE)
-    df['CEP_Bruto'] = df['Endereço Original'].apply(extrair_cep_bruto)
-    df['CEP_Final'] = df['CEP_Bruto'].apply(formatar_cep)
-    df['Numero_Final'] = df['Endereço Original'].apply(extrair_numero_inteligente)
-    
-    # 4. Limpeza Logradouro
-    def limpar_logradouro(row):
-        txt = row['Endereço Original'].replace('"', '').replace("'", "")
-        cep = row['CEP_Bruto']
-        num = row['Numero_Final']
-        
+    # 3. Tentar limpar CEP do endereço para facilitar extração de logradouro
+    def remover_cep_do_texto(row):
+        texto = row['Endereço Original']
+        cep = row['CEP_Final']
         if cep:
-            txt = re.sub(rf'{cep[:5]}.?{cep[5:]}', '', txt) 
-            txt = re.sub(rf'{cep}', '', txt)
-            if cep.startswith('0'): txt = re.sub(rf'{cep[1:]}', '', txt)
-            
-        if num and num != "S/N":
-            txt = re.sub(rf'\b{num}\b', '', txt)
-            
-        txt = re.sub(r'\bCEP\b[:.]?', '', txt, flags=re.IGNORECASE)
-        txt = re.sub(r'\s[-–]\s*$', '', txt)
-        match_uf = re.search(r'\b([A-Z]{2})\b$', txt.strip())
-        if match_uf: txt = re.sub(r'\b[A-Z]{2}\b$', '', txt)
-            
-        return txt.strip(' ,;/-')
-
-    df['Logradouro_Final'] = df.apply(limpar_logradouro, axis=1)
+            texto = texto.replace(cep, '').replace(cep.replace('-', ''), '')
+        return texto.strip(' ,-')
     
-    # 5. Geografia (Bairro/Cidade/UF)
-    def separar_geo(texto_orig):
-        uf = extrair_uf(texto_orig)
+    df['Endereço_Sem_CEP'] = df.apply(remover_cep_do_texto, axis=1)
+    
+    # 4. Extrair Número
+    df['Numero_Final'] = df['Endereço_Sem_CEP'].apply(extrair_numero)
+    
+    # 5. Logradouro (Simplificado: Tudo antes do número ou vírgula)
+    def extrair_logradouro(texto):
+        # Pega tudo antes da primeira vírgula ou do primeiro número
+        match = re.split(r',|nº|n°|\d+', texto)[0]
+        return match.strip()
+    
+    df['Logradouro_Final'] = df['Endereço_Sem_CEP'].apply(extrair_logradouro)
+    
+    # 6. Complemento (O que sobra depois do número)
+    # Lógica simplificada: Se tem numero, o que vem depois pode ser complemento/bairro
+    def extrair_complemento(row):
+        texto = row['Endereço_Sem_CEP']
+        num = row['Numero_Final']
+        if num and num != "S/N" and num in texto:
+            partes = texto.split(num, 1)
+            if len(partes) > 1:
+                return partes[1].strip(' ,-')
+        return ''
+    
+    df['Complemento_Bruto'] = df.apply(extrair_complemento, axis=1)
+    
+    # 7. Separar Bairro, Cidade e UF (Baseado em posição comum: Bairro - Cidade / UF)
+    # Esta parte é a mais difícil sem uma base de dados de CEPS. Vamos tentar heurísticas.
+    
+    def separar_geografia(texto):
+        # Tenta pegar UF (2 letras maiúsculas no fim)
+        uf = extrair_uf(texto)
         cidade = ''
         bairro = ''
+        
+        resto = texto
         if uf:
-            partes = re.split(r'[,-/]', texto_orig)
-            partes = [p.strip() for p in partes if p.strip()]
-            if partes and partes[-1].upper() == uf: partes.pop()
-            if partes: cidade = partes[-1]
-            if len(partes) > 1: bairro = partes[-2]
+            # Remove UF do fim
+            resto = re.sub(r'\b'+uf+r'\b', '', texto).strip(' ,/-')
+            
+        # Assume que o que sobrou no final é a cidade
+        partes = re.split(r'[,-]', resto)
+        partes = [p.strip() for p in partes if p.strip()]
+        
+        if len(partes) >= 1:
+            cidade = partes[-1]
+        if len(partes) >= 2:
+            bairro = partes[-2]
+        
+        # Limpeza extra se bairro for muito curto ou parecer complemento
+        if len(bairro) < 3 and len(partes) >= 3:
+             bairro = partes[-3] # Tenta pegar anterior
+             
         return pd.Series([bairro, cidade, uf])
 
-    df[['Bairro_Final', 'Cidade_Final', 'UF_Final']] = df['Endereço Original'].apply(separar_geo)
+    # Aplica separação na coluna original ou no complemento bruto? 
+    # Melhor aplicar no endereço original processado para ter contexto
+    df[['Bairro_Final', 'Cidade_Final', 'UF_Final']] = df['Endereço_Sem_CEP'].apply(separar_geografia)
+    
+    # 8. Região
     df['Regiao_Final'] = df['UF_Final'].apply(classificar_regiao)
     
-    # 6. Status
-    df['Status_Sistema'] = df.apply(lambda x: gerar_status(x['CEP_Final'], x['Numero_Final']), axis=1)
+    # 9. Complemento Final (Refinado)
+    df['Complemento_Final'] = df['Complemento_Bruto'].apply(lambda x: x if len(x) < 20 else '') # Se for muito longo, provavelmente é bairro/cidade
     
-    return df
-
-# ==========================================================
-# FLASK API
-# ==========================================================
-
-app = Flask(__name__)
-CORS(app)
-
-@app.route('/normalizar', methods=['POST'])
-def handle_normalizacao_api():
-    if 'import-file' not in request.files and 'file' not in request.files:
-        return jsonify({"error": "Nenhum arquivo enviado."}), 400
+    # 10. Mapear Nome e A/C
+    df['Nome_Final'] = df[col_nome] if col_nome else ''
+    df['Departamento'] = df[col_ac] if col_ac else ''
     
-    file = request.files.get('file') or request.files.get('import-file')
-    
-    try:
-        # Leitura Inteligente do Arquivo
-        if file.filename.endswith('.csv'):
-            try:
-                df = pd.read_csv(file, encoding='utf-8', sep=';')
-                if len(df.columns) < 2:
-                    file.seek(0)
-                    df = pd.read_csv(file, encoding='utf-8', sep=',')
-            except:
-                file.seek(0)
-                df = pd.read_csv(file, encoding='latin1', sep=';')
-        else:
-            df = pd.read_excel(file)
-            
-        # Processa
-        df_processado = processar_planilha_api(df)
-
-        # Mapeia para o JSON esperado pelo Frontend (index.html)
-        results = []
-        for index, row in df_processado.iterrows():
-            results.append({
-                "status": row['Status_Sistema'],
-                "cep": row['CEP_Final'],
-                "logradouro": row['Logradouro_Final'],
-                "numero": row['Numero_Final'],
-                "bairro": row['Bairro_Final'], 
-                "cidade": row['Cidade_Final'], 
-                "estado": row['UF_Final'], 
-                "regiao": row['Regiao_Final'],
-                "complemento": "", # Complemento é difícil extrair com precisão sem base, deixa vazio
-                "apelido_local": row['A/C_Final'], 
-                "fullAddress": row['Endereço Original']
-            })
-
-        return jsonify(results)
+    # 11. Status (Validação)
+    def validar(row):
+        erros = []
+        if not row['CEP_Final']: erros.append("Falta CEP")
+        if not row['Numero_Final']: erros.append("Falta Número")
+        if not row['UF_Final']: erros.append("Falta UF")
+        if not erros: return "OK"
+        return ", ".join(erros)
         
-    except Exception as e:
-        return jsonify({"error": f"Erro no servidor: {str(e)}"}), 500
+    df['Status_Sistema'] = df.apply(validar, axis=1)
+    
+    # --- ORGANIZAÇÃO FINAL DAS COLUNAS (ORDEM CORREIOS) ---
+    
+    # Gerar IDs sequenciais
+    df['ID'] = [f'ID_{i}' for i in range(len(df))]
+    
+    # 1. Definir a ordem exata das colunas internas
+    colunas_ordenadas = [
+        'ID', 
+        'Nome_Final', 
+        'CEP_Final', 
+        'Logradouro_Final', 
+        'Numero_Final', 
+        'Complemento_Final', 
+        'Bairro_Final', 
+        'Cidade_Final', 
+        'UF_Final', 
+        'Regiao_Final', 
+        'Departamento', 
+        'Endereço Original'
+    ]
+    
+    # 2. Filtrar o dataframe para ter apenas essas colunas
+    df_export = df[colunas_ordenadas].copy()
+    
+    # 3. Renomear para os cabeçalhos finais exigidos
+    df_export.columns = [
+        'ID',
+        'Nome (Clube)',
+        'CEP',
+        'Logradouro',
+        'N°',
+        'Complemento',
+        'Bairro',
+        'Cidade',
+        'UF',
+        'Região',
+        'Aos cuidados',
+        'Endereço Original'
+    ]
+    
+    return df_export
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001)
+# --- DOWNLOADER ---
+def convert_df(df):
+    output = io.BytesIO()
+    writer = pd.ExcelWriter(output, engine='xlsxwriter')
+    df.to_excel(writer, index=False, sheet_name='Sheet1')
+    writer.close()
+    processed_data = output.getvalue()
+    return processed_data
+
+# --- INTERFACE ---
+
+uploaded_file = st.file_uploader("Escolha um arquivo Excel (.xlsx) ou CSV", type=['xlsx', 'csv'])
+
+if uploaded_file is not None:
+    try:
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+            
+        st.write("### Pré-visualização dos dados originais:")
+        st.dataframe(df.head())
+        
+        # Seleção de Colunas
+        cols = df.columns.tolist()
+        
+        c1, c2, c3 = st.columns(3)
+        col_endereco = c1.selectbox("Selecione a coluna de ENDEREÇO COMPLETO:", cols, index=0)
+        col_nome = c2.selectbox("Coluna de Nome (Destinatário):", [None] + cols, index=1 if len(cols)>1 else 0)
+        col_ac = c3.selectbox("Coluna A/C (Departamento):", [None] + cols, index=len(cols)-1 if len(cols)>2 else 0)
+        
+        if st.button("Processar e Normalizar"):
+            with st.spinner('A IA está analisando os endereços...'):
+                df_processado = processar_planilha(df, col_endereco, col_nome, col_ac)
+                
+                st.success("Processamento concluído!")
+                
+                st.write("### Dados Normalizados:")
+                # Exibe a tabela sem estilização de status, pois a coluna Status foi removida para o layout final
+                st.dataframe(df_processado)
+                
+                # Botões de Download
+                csv = df_processado.to_csv(index=False).encode('utf-8-sig')
+                excel_data = convert_df(df_processado)
+                
+                c_down1, c_down2 = st.columns(2)
+                
+                c_down1.download_button(
+                    label="📥 Baixar em CSV",
+                    data=csv,
+                    file_name='enderecos_normalizados_correios.csv',
+                    mime='text/csv',
+                )
+                
+                c_down2.download_button(
+                    label="📥 Baixar em Excel",
+                    data=excel_data,
+                    file_name='enderecos_normalizados_correios.xlsx',
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                )
+                
+    except Exception as e:
+        st.error(f"Erro ao ler o arquivo: {e}")

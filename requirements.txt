@@ -1,5 +1,7 @@
-flask
-gunicorn
+fastapi
+uvicorn
 pandas
 openpyxl
-flask-cors
+xlsxwriter
+python-multipart
+gunicorn

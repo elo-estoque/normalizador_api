@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURAÇÃO DA API ---
-app = FastAPI(title="ELO-Normalizador API", description="API do Robô Blindado 3.5")
+app = FastAPI(title="ELO-Normalizador API", description="API do Robô Blindado 3.6 - Com Mapeamento")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,7 +22,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- FUNÇÕES DE EXTRAÇÃO ---
+# --- FUNÇÕES DE EXTRAÇÃO (REGEX) ---
 
 def extrair_cep_bruto(texto):
     if not isinstance(texto, str): return None
@@ -102,23 +102,27 @@ def processar_dataframe(df, col_map):
     df = df.copy()
     df['ID_Personalizado'] = [f'ID_{i+1}' for i in range(len(df))]
     
-    # Mapeamento seguro (se a coluna não existir, preenche com vazio)
+    # Mapeamento seguro das colunas opcionais
+    # Verifica se a chave existe no mapa, se tem valor, e se a coluna existe no DF
     df['Nome_Final'] = df[col_map['nome']] if col_map.get('nome') and col_map['nome'] in df.columns else ""
     df['Cidade_Final'] = df[col_map['cidade']] if col_map.get('cidade') and col_map['cidade'] in df.columns else ""
     df['UF_Final'] = df[col_map['uf']] if col_map.get('uf') and col_map['uf'] in df.columns else ""
     df['Regiao_Final'] = df[col_map['regiao']] if col_map.get('regiao') and col_map['regiao'] in df.columns else ""
     df['Bairro_Final'] = df[col_map['bairro']] if col_map.get('bairro') and col_map['bairro'] in df.columns else "" 
     
-    # Endereço é obrigatório, mas vamos garantir que não quebre
+    # Endereço é obrigatório, mas protegemos contra falhas
     col_endereco = col_map.get('endereco')
     if not col_endereco or col_endereco not in df.columns:
-        # Tenta achar a primeira coluna se não achou nada
+        # Se não achou a coluna mapeada, tenta a primeira como fallback
         col_endereco = df.columns[0]
     
     df[col_endereco] = df[col_endereco].astype(str)
+    
+    # Aplica as IAs de extração
     df['CEP_Final'] = df[col_endereco].apply(extrair_cep_bruto)
     df['Numero_Final'] = df[col_endereco].apply(extrair_numero_inteligente)
     
+    # Função interna para limpar o texto do logradouro removendo o que já foi extraído
     def limpar_texto(row):
         txt = str(row[col_endereco]).replace('"', '').replace("'", "")
         cep = row['CEP_Final']
@@ -140,7 +144,7 @@ def processar_dataframe(df, col_map):
 
     df['Logradouro_Final'] = df.apply(limpar_texto, axis=1)
     df['Complemento_Final'] = ""
-    df['Aos_Cuidados_Final'] = "" # Campo placeholder
+    df['Aos_Cuidados_Final'] = "" 
     df['STATUS_SISTEMA'] = df.apply(lambda x: gerar_status(x['CEP_Final'], x['Numero_Final']), axis=1)
     
     df = df.sort_values(by=['STATUS_SISTEMA'], ascending=False)
@@ -151,8 +155,9 @@ def processar_dataframe(df, col_map):
 @app.get("/")
 def health_check():
     logger.info("Health check chamado!")
-    return {"status": "online", "robot": "Blindado 3.5"}
+    return {"status": "online", "robot": "Blindado 3.6"}
 
+# ROTA 1: Ler o arquivo e dizer quais colunas existem (Popula o Modal)
 @app.post("/analisar_colunas")
 async def analisar_arquivo(file: UploadFile = File(...)):
     if not file.filename.endswith(('.xlsx', '.xls')):
@@ -163,10 +168,11 @@ async def analisar_arquivo(file: UploadFile = File(...)):
         df = pd.read_excel(io.BytesIO(contents))
         cols = [str(c) for c in df.columns]
         
+        # Inteligência para sugerir o mapeamento inicial
         sugestoes = {
-            "endereco": next((c for c in cols if any(x in c.lower() for x in ['endereço', 'endereco'])), cols[0] if cols else None),
-            "nome": next((c for c in cols if any(x in c.lower() for x in ['nome', 'clube', 'loja'])), None),
-            "cidade": next((c for c in cols if any(x in c.lower() for x in ['cidade', 'city'])), None),
+            "endereco": next((c for c in cols if any(x in c.lower() for x in ['endereço', 'endereco', 'rua', 'logradouro'])), cols[0] if cols else None),
+            "nome": next((c for c in cols if any(x in c.lower() for x in ['nome', 'clube', 'loja', 'cliente', 'destinatario'])), None),
+            "cidade": next((c for c in cols if any(x in c.lower() for x in ['cidade', 'city', 'municipio'])), None),
             "uf": next((c for c in cols if any(x in c.lower() for x in ['uf', 'estado'])), None),
             "regiao": next((c for c in cols if any(x in c.lower() for x in ['regiao', 'região'])), None),
             "bairro": next((c for c in cols if any(x in c.lower() for x in ['bairro'])), None)
@@ -177,37 +183,50 @@ async def analisar_arquivo(file: UploadFile = File(...)):
         logger.error(f"Erro ao analisar: {e}")
         raise HTTPException(status_code=500, detail=f"Erro ao ler arquivo: {str(e)}")
 
-# --- NOVO ENDPOINT: PREVIEW PARA IMPORTAÇÃO JSON ---
+# ROTA 2: Recebe o arquivo + O MAPA ESCOLHIDO e devolve o JSON para a tela
 @app.post("/preview_importacao")
-async def preview_importacao(file: UploadFile = File(...)):
+async def preview_importacao(
+    mapa: str = Form(None), 
+    file: UploadFile = File(...)
+):
     try:
         contents = await file.read()
         df = pd.read_excel(io.BytesIO(contents))
         df = df.astype(str).replace('nan', '')
         cols = [str(c) for c in df.columns]
 
-        # Lógica de Auto-Mapping (Tenta adivinhar as colunas sozinho)
-        mapa_auto = {
-            "endereco": next((c for c in cols if any(x in c.lower() for x in ['endereço', 'endereco', 'logradouro', 'rua'])), cols[0] if cols else None),
-            "nome": next((c for c in cols if any(x in c.lower() for x in ['nome', 'clube', 'loja', 'cliente', 'destinatario'])), ""),
-            "cidade": next((c for c in cols if any(x in c.lower() for x in ['cidade', 'city', 'municipio'])), ""),
-            "uf": next((c for c in cols if any(x in c.lower() for x in ['uf', 'estado'])), ""),
-            "bairro": next((c for c in cols if any(x in c.lower() for x in ['bairro'])), ""),
-            "regiao": next((c for c in cols if any(x in c.lower() for x in ['regiao'])), "")
-        }
+        # SE O USUÁRIO MANDOU O MAPA PELO MODAL, USA ELE.
+        if mapa:
+            col_map = json.loads(mapa)
+            mapa_final = {
+                "endereco": col_map.get('endereco', ''),
+                "nome": col_map.get('nome', ''),
+                "cidade": col_map.get('cidade', ''),
+                "uf": col_map.get('uf', ''),
+                "bairro": col_map.get('bairro', ''),
+                "regiao": col_map.get('regiao', '')
+            }
+        else:
+            # Fallback: Tenta adivinhar se não mandou mapa (segurança)
+            mapa_final = {
+                "endereco": next((c for c in cols if any(x in c.lower() for x in ['endereço', 'endereco', 'logradouro', 'rua'])), cols[0] if cols else None),
+                "nome": next((c for c in cols if any(x in c.lower() for x in ['nome', 'clube', 'loja'])), ""),
+                "cidade": next((c for c in cols if any(x in c.lower() for x in ['cidade', 'city'])), ""),
+                "uf": next((c for c in cols if any(x in c.lower() for x in ['uf', 'estado'])), ""),
+                "bairro": next((c for c in cols if any(x in c.lower() for x in ['bairro'])), ""),
+                "regiao": next((c for c in cols if any(x in c.lower() for x in ['regiao'])), "")
+            }
 
         # Processa os dados
-        df_processado = processar_dataframe(df, mapa_auto)
+        df_processado = processar_dataframe(df, mapa_final)
 
-        # Monta a LISTA JSON que o Frontend espera
         resultado = []
         for _, row in df_processado.iterrows():
-            # Define o 'A/C' (Aos cuidados): Tenta usar Nome, senão vazio
             apelido = row['Nome_Final'] if row['Nome_Final'] else "Cliente"
             
-            # Recupera o endereço original para salvar no histórico
-            col_orig = mapa_auto.get('endereco')
-            endereco_full = row[col_orig] if col_orig in row else ""
+            # Pega o endereço original
+            col_orig = mapa_final.get('endereco')
+            endereco_full = row[col_orig] if col_orig and col_orig in row else ""
 
             resultado.append({
                 "status": row['STATUS_SISTEMA'],
@@ -228,6 +247,7 @@ async def preview_importacao(file: UploadFile = File(...)):
         logger.error(f"Erro no preview: {e}")
         raise HTTPException(status_code=500, detail=f"Erro ao processar preview: {str(e)}")
 
+# ROTA 3: Processamento antigo para download de Excel (Mantido para compatibilidade)
 @app.post("/processar")
 async def processar(
     tipo_saida: str = Form(...),

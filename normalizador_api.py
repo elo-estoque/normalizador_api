@@ -7,7 +7,6 @@ import os
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List
 
@@ -16,17 +15,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURAÇÃO DA API ---
-app = FastAPI(title="ELO-API", description="Normalizador + Gerenciador de Estoque Seguro")
+app = FastAPI(title="ELO-API", description="Backend Seguro Elo Brindes")
 
-# --- CONFIGURAÇÃO DE CORS (A CORREÇÃO DO ERRO VERMELHO) ---
-# Isso diz ao navegador que seu site pode falar com essa API
+# --- CORREÇÃO DO CORS (CRÍTICO) ---
+# Adiciona seu domínio explicitamente para o navegador não bloquear
 origins = [
-    "https://entregas.elobrindes.com.br",     # Seu site oficial
-    "https://www.entregas.elobrindes.com.br", # Variação com www
-    "https://admin-entregas.elobrindes.com.br", # O próprio Directus (as vezes necessário)
-    "http://localhost:8000",                  # Para seus testes locais
-    "http://127.0.0.1:8000",
-    "*"                                       # Fallback para garantir
+    "https://entregas.elobrindes.com.br",
+    "https://www.entregas.elobrindes.com.br",
+    "https://api-entregas.elobrindes.com.br",
+    "http://localhost:8000",
+    "*" # Fallback (mantenha por segurança se o HTTPS falhar na identificação)
 ]
 
 app.add_middleware(
@@ -37,16 +35,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- VARIÁVEIS DE AMBIENTE (Lê do seu arquivo .env ou do servidor) ---
-# Certifique-se que no seu servidor essas variáveis existem!
+# --- VARIÁVEIS DE AMBIENTE ---
+# Certifique-se que no seu servidor elas estão configuradas corretamente!
 DIRECTUS_URL = os.environ.get("DIRECTUS_URL", "https://admin-entregas.elobrindes.com.br")
-# Você precisa criar uma variável chamada DIRECTUS_ADMIN_TOKEN no seu servidor
-# ou usar a SECRET se ela for um token estático.
-DIRECTUS_ADMIN_TOKEN = os.environ.get("DIRECTUS_ADMIN_TOKEN") 
+DIRECTUS_ADMIN_TOKEN = os.environ.get("DIRECTUS_ADMIN_TOKEN")
 
-# Validação de segurança ao iniciar
 if not DIRECTUS_ADMIN_TOKEN:
-    logger.warning("⚠️ ALERTA: DIRECTUS_ADMIN_TOKEN não encontrado nas variáveis de ambiente! A API de estoque falhará.")
+    logger.warning("⚠️ ALERTA: Token de Admin não encontrado! A API de estoque falhará.")
 
 # --- MODELS ---
 class PedidoItem(BaseModel):
@@ -115,7 +110,7 @@ def health_check():
 @app.post("/api/finalizar_envio")
 async def finalizar_envio(pedido: PedidoRequest):
     if not DIRECTUS_ADMIN_TOKEN:
-        raise HTTPException(status_code=500, detail="Configuração de Token inválida no servidor.")
+        raise HTTPException(status_code=500, detail="Token de Admin não configurado no servidor.")
 
     headers = {
         "Authorization": f"Bearer {DIRECTUS_ADMIN_TOKEN}",
@@ -170,7 +165,7 @@ async def finalizar_envio(pedido: PedidoRequest):
             logger.error(f"Erro crítico: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-# --- MODULO DE IMPORTAÇÃO (NORMALIZADOR) MANTIDO ---
+# --- LEGADO: NORMALIZADOR (Mantido para compatibilidade) ---
 def extrair_cep_bruto(texto):
     if not isinstance(texto, str): return None
     texto = texto.replace('"', '').replace("'", "").strip()

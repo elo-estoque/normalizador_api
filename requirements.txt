@@ -5,3 +5,5 @@ openpyxl
 xlsxwriter
 python-multipart
 gunicorn
+httpx
+pydantic

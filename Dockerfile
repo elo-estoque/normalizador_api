@@ -6,12 +6,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia todo o resto
+# Copia o código
 COPY . .
 
-# Expõe a porta que definimos
+# Expõe a porta
 EXPOSE 8000
 
-# Roda o servidor ouvindo em TODAS as interfaces (0.0.0.0)
+# Comando de inicialização simplificado
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-

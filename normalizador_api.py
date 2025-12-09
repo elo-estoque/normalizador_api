@@ -18,29 +18,35 @@ logger = logging.getLogger(__name__)
 # --- CONFIGURAÇÃO DA API ---
 app = FastAPI(title="ELO-API", description="Normalizador + Gerenciador de Estoque Seguro")
 
-# --- CONFIGURAÇÃO DE CORS (Origens Permitidas) ---
+# --- CONFIGURAÇÃO DE CORS (A CORREÇÃO DO ERRO VERMELHO) ---
+# Isso diz ao navegador que seu site pode falar com essa API
 origins = [
-    "https://entregas.elobrindes.com.br",
-    "https://www.entregas.elobrindes.com.br",
-    "http://localhost:8000",
+    "https://entregas.elobrindes.com.br",     # Seu site oficial
+    "https://www.entregas.elobrindes.com.br", # Variação com www
+    "https://admin-entregas.elobrindes.com.br", # O próprio Directus (as vezes necessário)
+    "http://localhost:8000",                  # Para seus testes locais
     "http://127.0.0.1:8000",
-    "*" # Fallback
+    "*"                                       # Fallback para garantir
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS", "PATCH"],
+    allow_methods=["GET", "POST", "OPTIONS", "PATCH", "DELETE"],
     allow_headers=["*"],
 )
 
-# --- VARIÁVEIS DE AMBIENTE (SEM VALORES HARDCODED) ---
-DIRECTUS_URL = os.environ.get("DIRECTUS_URL")
-DIRECTUS_ADMIN_TOKEN = os.environ.get("DIRECTUS_ADMIN_TOKEN")
+# --- VARIÁVEIS DE AMBIENTE (Lê do seu arquivo .env ou do servidor) ---
+# Certifique-se que no seu servidor essas variáveis existem!
+DIRECTUS_URL = os.environ.get("DIRECTUS_URL", "https://admin-entregas.elobrindes.com.br")
+# Você precisa criar uma variável chamada DIRECTUS_ADMIN_TOKEN no seu servidor
+# ou usar a SECRET se ela for um token estático.
+DIRECTUS_ADMIN_TOKEN = os.environ.get("DIRECTUS_ADMIN_TOKEN") 
 
-if not DIRECTUS_URL or not DIRECTUS_ADMIN_TOKEN:
-    logger.warning("ATENÇÃO: Variáveis de ambiente DIRECTUS_URL ou DIRECTUS_ADMIN_TOKEN não configuradas!")
+# Validação de segurança ao iniciar
+if not DIRECTUS_ADMIN_TOKEN:
+    logger.warning("⚠️ ALERTA: DIRECTUS_ADMIN_TOKEN não encontrado nas variáveis de ambiente! A API de estoque falhará.")
 
 # --- MODELS ---
 class PedidoItem(BaseModel):
@@ -58,7 +64,6 @@ class PedidoRequest(BaseModel):
     itens: List[PedidoItem]
 
 # --- LÓGICA DE ESTOQUE (BACKEND SEGURO) ---
-
 async def baixar_estoque_seguro(item: PedidoItem, client: httpx.AsyncClient):
     headers = {
         "Authorization": f"Bearer {DIRECTUS_ADMIN_TOKEN}",
@@ -69,6 +74,7 @@ async def baixar_estoque_seguro(item: PedidoItem, client: httpx.AsyncClient):
     resp_pai = await client.get(f"{DIRECTUS_URL}/items/estoque_cliente/{item.estoque_pai_id}", headers=headers)
     
     if resp_pai.status_code != 200:
+        logger.error(f"Erro Directus Pai: {resp_pai.text}")
         raise HTTPException(status_code=404, detail=f"Estoque {item.estoque_pai_id} não encontrado.")
     
     dados_pai = resp_pai.json()['data']
@@ -104,12 +110,12 @@ async def baixar_estoque_seguro(item: PedidoItem, client: httpx.AsyncClient):
 
 @app.get("/")
 def health_check():
-    return {"status": "online"}
+    return {"status": "online", "system": "Elo Brindes API"}
 
 @app.post("/api/finalizar_envio")
 async def finalizar_envio(pedido: PedidoRequest):
     if not DIRECTUS_ADMIN_TOKEN:
-        raise HTTPException(status_code=500, detail="Token Admin não configurado no servidor.")
+        raise HTTPException(status_code=500, detail="Configuração de Token inválida no servidor.")
 
     headers = {
         "Authorization": f"Bearer {DIRECTUS_ADMIN_TOKEN}",
@@ -132,7 +138,7 @@ async def finalizar_envio(pedido: PedidoRequest):
             resp_lote = await client.post(f"{DIRECTUS_URL}/items/lotes_envio", headers=headers, json=lote_payload)
             if resp_lote.status_code not in [200, 201]:
                 logger.error(f"Erro Directus Lote: {resp_lote.text}")
-                raise HTTPException(status_code=500, detail="Erro ao criar lote.")
+                raise HTTPException(status_code=500, detail="Erro ao criar registro do lote.")
             
             novo_lote_id = resp_lote.json()['data']['id']
             
@@ -164,8 +170,7 @@ async def finalizar_envio(pedido: PedidoRequest):
             logger.error(f"Erro crítico: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-# --- LEGADO: NORMALIZADOR DE EXCEL (Mantido igual) ---
-
+# --- MODULO DE IMPORTAÇÃO (NORMALIZADOR) MANTIDO ---
 def extrair_cep_bruto(texto):
     if not isinstance(texto, str): return None
     texto = texto.replace('"', '').replace("'", "").strip()
@@ -180,7 +185,6 @@ def extrair_numero_inteligente(texto):
     texto = texto.upper().replace('"', '').strip()
     texto = re.sub(r'\b(APTO|BLOCO|SALA|CJ|KM)\.?\s*\d+[A-Z]?\b', '', texto, flags=re.IGNORECASE)
     texto = re.sub(r'\d{5}[-.]?\d{3}', '', texto)
-    
     if re.search(r'\b(S/N|SN|SEM N)\b', texto): return "S/N"
     match = re.search(r',\s*(\d+)', texto)
     if match: return match.group(1)
@@ -199,7 +203,6 @@ def processar_dataframe(df, col_map):
     df = df.copy()
     col_end = col_map.get('endereco', df.columns[0])
     df[col_end] = df[col_end].astype(str)
-    
     df['CEP_Final'] = df[col_end].apply(extrair_cep_bruto)
     df['Numero_Final'] = df[col_end].apply(extrair_numero_inteligente)
     df['Nome_Final'] = df[col_map['nome']] if col_map.get('nome') in df.columns else ""
@@ -240,7 +243,6 @@ async def preview_importacao(mapa: str = Form(...), file: UploadFile = File(...)
         df = pd.read_excel(io.BytesIO(c))
         m = json.loads(mapa)
         df_p = processar_dataframe(df, m)
-        
         res = []
         for _, row in df_p.iterrows():
             res.append({

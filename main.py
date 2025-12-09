@@ -19,16 +19,15 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="ELO-API",
     description="Backend Seguro Elo Brindes para gestão de pedidos e normalização de endereços.",
-    version="1.2.0"
+    version="1.4.0"
 )
 
 # --- CORREÇÃO DO CORS ---
-# Permite as origens do frontend e desenvolvimento local
 origins = [
     "https://entregas.elobrindes.com.br",
     "https://www.entregas.elobrindes.com.br",
     "http://localhost:8000",
-    "*" # Fallback para garantir funcionamento se o header falhar
+    "*" 
 ]
 
 app.add_middleware(
@@ -40,8 +39,8 @@ app.add_middleware(
 )
 
 # --- VARIÁVEIS DE AMBIENTE ---
-# Atualizado com a URL correta (com www) como padrão, caso a variável de ambiente falhe
-DIRECTUS_URL = os.environ.get("DIRECTUS_URL", "https://www.admin-entregas.elobrindes.com.br")
+# URL corrigida sem www conforme sua indicação
+DIRECTUS_URL = os.environ.get("DIRECTUS_URL", "https://admin-entregas.elobrindes.com.br")
 DIRECTUS_ADMIN_TOKEN = os.environ.get("DIRECTUS_ADMIN_TOKEN")
 
 if not DIRECTUS_ADMIN_TOKEN:
@@ -65,9 +64,7 @@ class PedidoRequest(BaseModel):
 # --- LÓGICA DE ESTOQUE (BACKEND SEGURO) ---
 
 async def restaurar_estoque(item: PedidoItem, client: httpx.AsyncClient, headers: Dict[str, str]):
-    """Função de rollback para restaurar o estoque em caso de falha."""
     try:
-        # Restaura Estoque Pai
         resp_pai = await client.get(f"{DIRECTUS_URL}/items/estoque_cliente/{item.estoque_pai_id}", headers=headers)
         if resp_pai.status_code == 200:
             qtd_atual_pai = int(resp_pai.json()['data'].get('quantidade_disponivel', 0))
@@ -77,7 +74,6 @@ async def restaurar_estoque(item: PedidoItem, client: httpx.AsyncClient, headers
                 json={"quantidade_disponivel": qtd_atual_pai + item.quantidade}
             )
         
-        # Restaura Estoque Filho (Lote)
         if item.lote_estoque_id:
             resp_lote = await client.get(f"{DIRECTUS_URL}/items/estoque_lotes/{item.lote_estoque_id}", headers=headers)
             if resp_lote.status_code == 200:
@@ -92,8 +88,6 @@ async def restaurar_estoque(item: PedidoItem, client: httpx.AsyncClient, headers
         logger.error(f"⚠️ ERRO CRÍTICO NO ROLLBACK: Falha ao restaurar estoque para {item.produto_id}. Erro: {e}")
 
 async def baixar_estoque_seguro(item: PedidoItem, client: httpx.AsyncClient, headers: Dict[str, str]):
-    
-    # 1. Busca Estoque Pai
     resp_pai = await client.get(f"{DIRECTUS_URL}/items/estoque_cliente/{item.estoque_pai_id}", headers=headers)
     
     if resp_pai.status_code != 200:
@@ -106,7 +100,6 @@ async def baixar_estoque_seguro(item: PedidoItem, client: httpx.AsyncClient, hea
     if qtd_atual_pai < item.quantidade:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Saldo insuficiente (Geral) para {item.produto_id}. Disp: {qtd_atual_pai}")
 
-    # 2. Busca e Baixa Estoque Filho (Lote) se houver
     if item.lote_estoque_id:
         resp_lote = await client.get(f"{DIRECTUS_URL}/items/estoque_lotes/{item.lote_estoque_id}", headers=headers)
         if resp_lote.status_code == 200:
@@ -125,7 +118,6 @@ async def baixar_estoque_seguro(item: PedidoItem, client: httpx.AsyncClient, hea
                 logger.error(f"Falha ao dar patch no lote {item.lote_estoque_id}. Erro: {resp_patch_lote.text}")
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Falha ao atualizar o estoque de lote.")
 
-    # 3. Baixa Estoque Pai
     resp_patch_pai = await client.patch(
         f"{DIRECTUS_URL}/items/estoque_cliente/{item.estoque_pai_id}",
         headers=headers,
@@ -133,15 +125,13 @@ async def baixar_estoque_seguro(item: PedidoItem, client: httpx.AsyncClient, hea
     )
     if resp_patch_pai.status_code not in [200, 204]:
         logger.error(f"Falha ao dar patch no estoque pai {item.estoque_pai_id}. Erro: {resp_patch_pai.text}")
-        # Neste ponto, não há rollback para o lote se deu certo, mas é a última etapa.
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Falha ao atualizar o estoque principal.")
-
 
 # --- ENDPOINTS ---
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "system": "Elo Brindes API", "version": "1.2.0"}
+    return {"status": "online", "system": "Elo Brindes API", "version": "1.4.0"}
 
 @app.post("/api/finalizar_envio", status_code=status.HTTP_201_CREATED)
 async def finalizar_envio(pedido: PedidoRequest):
@@ -158,7 +148,6 @@ async def finalizar_envio(pedido: PedidoRequest):
 
     async with httpx.AsyncClient() as client:
         try:
-            # 1. Cria Lote
             nome_lote = f"Envio Portal - {len(pedido.itens)} itens"
             lote_payload = {
                 "nome_lote": nome_lote,
@@ -176,12 +165,10 @@ async def finalizar_envio(pedido: PedidoRequest):
             
             novo_lote_id = resp_lote.json().get('data', {}).get('id')
             
-            # 2. Processa Itens e Baixa Estoque
             for item in pedido.itens:
                 await baixar_estoque_seguro(item, client, headers)
                 itens_processados_com_sucesso.append(item)
                 
-                # 3. Cria Solicitação (Movimentação)
                 obs = f"[REF_LOTE:{item.estoque_pai_id}|{item.lote_estoque_id or 0}]"
                 if item.lote_descricao: obs += f" [{item.lote_descricao}]"
 
@@ -200,13 +187,11 @@ async def finalizar_envio(pedido: PedidoRequest):
 
                 if resp_solic.status_code not in [200, 201]:
                     logger.error(f"Erro ao criar solicitação para produto {item.produto_id}: {resp_solic.text}")
-                    # CRÍTICO: Se a solicitação falhar, devemos tentar reverter as baixas de estoque
                     raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Falha ao criar solicitação para o produto {item.produto_id}.")
             
             return {"status": "success", "lote_id": novo_lote_id, "message": "Pedido e baixas de estoque finalizados com sucesso."}
 
         except HTTPException as he:
-            # Se a exceção for de HTTP (erro de estoque ou Directus), tentamos o rollback
             if itens_processados_com_sucesso:
                 logger.warning(f"Executando rollback após falha de HTTP: {he.detail}")
                 for item in itens_processados_com_sucesso:
@@ -214,7 +199,6 @@ async def finalizar_envio(pedido: PedidoRequest):
             raise he
         
         except Exception as e:
-            # Em caso de erro inesperado, tentamos o rollback para o que deu certo
             if itens_processados_com_sucesso:
                 logger.error(f"Erro crítico inesperado. Executando rollback. Erro: {e}")
                 for item in itens_processados_com_sucesso:
@@ -225,38 +209,22 @@ async def finalizar_envio(pedido: PedidoRequest):
 def extrair_cep_bruto(texto: Any) -> Optional[str]:
     if not isinstance(texto, str): return None
     texto = texto.upper().replace('"', '').replace("'", "").strip()
-    
-    # Padrão 1: XX.XXX-XXX ou XX XXX-XXX (com ou sem ponto/espaço)
     match = re.search(r'\b\d{2}[. ]?\d{3}-\d{3}\b', texto)
     if match: return re.sub(r'\D', '', match.group(0))
-    
-    # Padrão 2: 8 dígitos juntos (sem ser parte de um número maior)
     match8 = re.search(r'(?<!\d)(\d{8})(?!\d)', texto)
     if match8: return match8.group(1)
-    
     return None
 
 def extrair_numero_inteligente(texto: Any) -> str:
     if not isinstance(texto, str): return ""
     texto = texto.upper().replace('"', '').strip()
-    
-    # Remove elementos que não são o número principal: Apto, Bloco, Sala, Lote, Quadra, KM
     texto_limpo = re.sub(r'\b(APTO|BLOCO|SALA|CJ|KM|LT|QD)\.?\s*\d+[A-Z]?\b', '', texto, flags=re.IGNORECASE)
-    
-    # Remove qualquer sequência de 8 dígitos (provavelmente o CEP)
     texto_limpo = re.sub(r'\d{5}[-.]?\d{3}', '', texto_limpo)
-    
-    # Verifica se é "Sem Número"
     if re.search(r'\b(S/N|SN|SEM N|SEM NUMERO)\b', texto_limpo): return "S/N"
-    
-    # Busca número após vírgula (padrão comum: Rua X, 123)
     match = re.search(r',\s*(\d+)\b', texto_limpo)
     if match: return match.group(1)
-    
-    # Busca o último número na string (mais arriscado, mas necessário)
     match_fim = re.search(r'\s(\d+)\s*$', texto_limpo.strip())
     if match_fim: return match_fim.group(1)
-    
     return ""
 
 def gerar_status(cep: Optional[str], numero: str) -> str:
@@ -268,38 +236,22 @@ def gerar_status(cep: Optional[str], numero: str) -> str:
 
 def processar_dataframe(df: pd.DataFrame, col_map: Dict[str, str]) -> pd.DataFrame:
     df_p = df.copy()
-    
-    # Coluna de endereço é crítica e deve existir
     col_end = col_map.get('endereco')
     if not col_end or col_end not in df_p.columns:
          raise ValueError(f"Coluna de endereço '{col_end}' não encontrada no arquivo.")
-
     df_p[col_end] = df_p[col_end].astype(str).fillna("")
-    
-    # Aplica funções de extração
     df_p['CEP_Final'] = df_p[col_end].apply(extrair_cep_bruto)
     df_p['Numero_Final'] = df_p[col_end].apply(extrair_numero_inteligente)
-    
-    # Mapeamento de outras colunas, usando "" ou "N/A" se não mapeadas
     df_p['Nome_Final'] = df_p.get(col_map.get('nome', ''), "").astype(str).fillna("")
     df_p['Cidade_Final'] = df_p.get(col_map.get('cidade', ''), "N/A").astype(str).fillna("N/A")
     df_p['UF_Final'] = df_p.get(col_map.get('uf', ''), "N/A").astype(str).fillna("N/A")
     df_p['Bairro_Final'] = df_p.get(col_map.get('bairro', ''), "N/A").astype(str).fillna("N/A")
-    
     def limpar_logradouro(row):
         t = str(row[col_end])
-        # Remove o CEP bruto
-        if row['CEP_Final']: 
-            t = t.replace(row['CEP_Final'], '').replace(re.sub(r'\D', '', row['CEP_Final']), '')
-        # Remove o número bruto
-        if row['Numero_Final'] and row['Numero_Final'] != "S/N":
-             t = re.sub(r'(,\s*)?\b' + re.escape(row['Numero_Final']) + r'\b', '', t, flags=re.IGNORECASE)
-        
-        # Tenta remover elementos de complemento comuns que não foram removidos pelo extrator de número
+        if row['CEP_Final']: t = t.replace(row['CEP_Final'], '').replace(re.sub(r'\D', '', row['CEP_Final']), '')
+        if row['Numero_Final'] and row['Numero_Final'] != "S/N": t = re.sub(r'(,\s*)?\b' + re.escape(row['Numero_Final']) + r'\b', '', t, flags=re.IGNORECASE)
         t = re.sub(r'\b(APTO|BLOCO|SALA|CJ|KM|LT|QD)\.?\s*\d+[A-Z]?\b', '', t, flags=re.IGNORECASE)
-
         return t.strip(' ,;-.')
-    
     df_p['Logradouro_Final'] = df_p.apply(limpar_logradouro, axis=1)
     df_p['STATUS_SISTEMA'] = df_p.apply(lambda x: gerar_status(x['CEP_Final'], x['Numero_Final']), axis=1)
     return df_p
@@ -307,11 +259,9 @@ def processar_dataframe(df: pd.DataFrame, col_map: Dict[str, str]) -> pd.DataFra
 @app.post("/analisar_colunas")
 async def analisar_arquivo(file: UploadFile = File(...)):
     try:
-        # Uso de BytesIO como context manager para garantir que o arquivo seja fechado
         content = await file.read()
         with io.BytesIO(content) as buffer:
             df = pd.read_excel(buffer)
-        
         cols = [str(x) for x in df.columns]
         sugestoes = {
             "endereco": next((c for c in cols if any(x in c.lower() for x in ['endereço', 'endereco', 'rua', 'logradouro'])), None),
@@ -331,20 +281,12 @@ async def preview_importacao(mapa: str = Form(...), file: UploadFile = File(...)
         content = await file.read()
         with io.BytesIO(content) as buffer:
             df = pd.read_excel(buffer)
-
         m = json.loads(mapa)
-        
-        # Validar se a coluna 'endereco' foi mapeada
         if 'endereco' not in m or not m['endereco']:
              raise ValueError("A coluna de endereço deve ser mapeada.")
-             
         df_p = processar_dataframe(df, m)
-        
-        # Pega a coluna original do endereço para o campo 'fullAddress'
         coluna_endereco_original = m['endereco']
-        
         res = []
-        # Limitando o preview a 50 linhas para evitar sobrecarga
         for _, row in df_p.head(50).iterrows():
             res.append({
                 "status": row['STATUS_SISTEMA'],
@@ -364,7 +306,7 @@ async def preview_importacao(mapa: str = Form(...), file: UploadFile = File(...)
         logger.error(f"Erro ao gerar preview de importação: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Erro ao processar a importação: {str(e)}")
 
-# --- INICIALIZAÇÃO PROGRAMÁTICA (Para segurança no Dokploy) ---
+# INICIALIZAÇÃO PROGRAMÁTICA (Necessária se for rodar via python main.py no Docker)
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)

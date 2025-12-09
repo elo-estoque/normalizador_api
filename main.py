@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import httpx
+import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -18,16 +19,16 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="ELO-API",
     description="Backend Seguro Elo Brindes para gestão de pedidos e normalização de endereços.",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 # --- CORREÇÃO DO CORS ---
+# Permite as origens do frontend e desenvolvimento local
 origins = [
     "https://entregas.elobrindes.com.br",
     "https://www.entregas.elobrindes.com.br",
-    "https://api-entregas.elobrindes.com.br",
     "http://localhost:8000",
-    "*" # Fallback
+    "*" # Fallback para garantir funcionamento se o header falhar
 ]
 
 app.add_middleware(
@@ -39,7 +40,8 @@ app.add_middleware(
 )
 
 # --- VARIÁVEIS DE AMBIENTE ---
-DIRECTUS_URL = os.environ.get("DIRECTUS_URL", "https://admin-entregas.elobrindes.com.br")
+# Atualizado com a URL correta (com www) como padrão, caso a variável de ambiente falhe
+DIRECTUS_URL = os.environ.get("DIRECTUS_URL", "https://www.admin-entregas.elobrindes.com.br")
 DIRECTUS_ADMIN_TOKEN = os.environ.get("DIRECTUS_ADMIN_TOKEN")
 
 if not DIRECTUS_ADMIN_TOKEN:
@@ -139,7 +141,7 @@ async def baixar_estoque_seguro(item: PedidoItem, client: httpx.AsyncClient, hea
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "system": "Elo Brindes API", "version": "1.1.0"}
+    return {"status": "online", "system": "Elo Brindes API", "version": "1.2.0"}
 
 @app.post("/api/finalizar_envio", status_code=status.HTTP_201_CREATED)
 async def finalizar_envio(pedido: PedidoRequest):
@@ -361,3 +363,8 @@ async def preview_importacao(mapa: str = Form(...), file: UploadFile = File(...)
     except Exception as e:
         logger.error(f"Erro ao gerar preview de importação: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Erro ao processar a importação: {str(e)}")
+
+# --- INICIALIZAÇÃO PROGRAMÁTICA (Para segurança no Dokploy) ---
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)

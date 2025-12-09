@@ -9,7 +9,7 @@ import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union # ADICIONEI UNION AQUI
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="ELO-API",
     description="Backend Seguro Elo Brindes para gestão de pedidos e normalização de endereços.",
-    version="1.4.0"
+    version="1.7.0"
 )
 
 # --- CORREÇÃO DO CORS ---
@@ -39,29 +39,29 @@ app.add_middleware(
 )
 
 # --- VARIÁVEIS DE AMBIENTE ---
-# URL corrigida sem www conforme sua indicação
 DIRECTUS_URL = os.environ.get("DIRECTUS_URL", "https://admin-entregas.elobrindes.com.br")
 DIRECTUS_ADMIN_TOKEN = os.environ.get("DIRECTUS_ADMIN_TOKEN")
 
 if not DIRECTUS_ADMIN_TOKEN:
     logger.warning("⚠️ ALERTA: Token de Admin não encontrado! A API de estoque falhará.")
 
-# --- MODELS ---
+# --- MODELS (AQUI ESTÁ A CORREÇÃO DO ERRO 422) ---
+# Alterei para aceitar int OU str, pois o Directus pode mandar IDs como texto
 class PedidoItem(BaseModel):
-    produto_id: int
+    produto_id: Union[int, str]      # Aceita ID numérico ou UUID (texto)
     quantidade: int
-    endereco_id: int
+    endereco_id: Union[int, str]     # Aceita ID numérico ou UUID
     estoque_pai_id: str
-    lote_estoque_id: Optional[int] = None
+    lote_estoque_id: Optional[Union[int, str]] = None # Aceita ambos
     lote_descricao: Optional[str] = None
 
 class PedidoRequest(BaseModel):
-    organization_id: str
-    user_id: str
+    organization_id: Union[int, str] # Aceita ambos
+    user_id: Union[int, str]         # Aceita ambos
     data_postagem: str
     itens: List[PedidoItem]
 
-# --- LÓGICA DE ESTOQUE (BACKEND SEGURO) ---
+# --- LÓGICA DE ESTOQUE (SEU CÓDIGO ORIGINAL MANTIDO) ---
 
 async def restaurar_estoque(item: PedidoItem, client: httpx.AsyncClient, headers: Dict[str, str]):
     try:
@@ -131,7 +131,7 @@ async def baixar_estoque_seguro(item: PedidoItem, client: httpx.AsyncClient, hea
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "system": "Elo Brindes API", "version": "1.4.0"}
+    return {"status": "online", "system": "Elo Brindes API", "version": "1.7.0"}
 
 @app.post("/api/finalizar_envio", status_code=status.HTTP_201_CREATED)
 async def finalizar_envio(pedido: PedidoRequest):

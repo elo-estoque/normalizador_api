@@ -9,7 +9,7 @@ import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any, Union # ADICIONEI UNION AQUI
+from typing import Optional, List, Dict, Any, Union
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -19,10 +19,10 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="ELO-API",
     description="Backend Seguro Elo Brindes para gestão de pedidos e normalização de endereços.",
-    version="1.7.0"
+    version="1.8.0" # Versão atualizada com correção de aprovação
 )
 
-# --- CORREÇÃO DO CORS ---
+# --- CONFIGURAÇÃO DO CORS ---
 origins = [
     "https://entregas.elobrindes.com.br",
     "https://www.entregas.elobrindes.com.br",
@@ -45,23 +45,22 @@ DIRECTUS_ADMIN_TOKEN = os.environ.get("DIRECTUS_ADMIN_TOKEN")
 if not DIRECTUS_ADMIN_TOKEN:
     logger.warning("⚠️ ALERTA: Token de Admin não encontrado! A API de estoque falhará.")
 
-# --- MODELS (AQUI ESTÁ A CORREÇÃO DO ERRO 422) ---
-# Alterei para aceitar int OU str, pois o Directus pode mandar IDs como texto
+# --- MODELS ---
 class PedidoItem(BaseModel):
     produto_id: Union[int, str]      # Aceita ID numérico ou UUID (texto)
     quantidade: int
     endereco_id: Union[int, str]     # Aceita ID numérico ou UUID
     estoque_pai_id: str
-    lote_estoque_id: Optional[Union[int, str]] = None # Aceita ambos
+    lote_estoque_id: Optional[Union[int, str]] = None 
     lote_descricao: Optional[str] = None
 
 class PedidoRequest(BaseModel):
-    organization_id: Union[int, str] # Aceita ambos
-    user_id: Union[int, str]         # Aceita ambos
+    organization_id: Union[int, str] 
+    user_id: Union[int, str]         
     data_postagem: str
     itens: List[PedidoItem]
 
-# --- LÓGICA DE ESTOQUE (SEU CÓDIGO ORIGINAL MANTIDO) ---
+# --- LÓGICA DE ESTOQUE ---
 
 async def restaurar_estoque(item: PedidoItem, client: httpx.AsyncClient, headers: Dict[str, str]):
     try:
@@ -131,7 +130,7 @@ async def baixar_estoque_seguro(item: PedidoItem, client: httpx.AsyncClient, hea
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "system": "Elo Brindes API", "version": "1.7.0"}
+    return {"status": "online", "system": "Elo Brindes API", "version": "1.8.0"}
 
 @app.post("/api/finalizar_envio", status_code=status.HTTP_201_CREATED)
 async def finalizar_envio(pedido: PedidoRequest):
@@ -148,10 +147,29 @@ async def finalizar_envio(pedido: PedidoRequest):
 
     async with httpx.AsyncClient() as client:
         try:
+            # 1. VERIFICAÇÃO DE REGRAS DE APROVAÇÃO (CORREÇÃO AQUI)
+            # Busca configurações da Organização
+            resp_org = await client.get(f"{DIRECTUS_URL}/items/organizacoes/{pedido.organization_id}?fields=exige_aprovacao", headers=headers)
+            org_data = resp_org.json().get('data', {}) if resp_org.status_code == 200 else {}
+            exige_aprovacao = org_data.get('exige_aprovacao', False)
+
+            # Busca perfil do Usuário (para saber se é gestor e pula aprovação)
+            resp_user = await client.get(f"{DIRECTUS_URL}/users/{pedido.user_id}?fields=eh_gestor", headers=headers)
+            user_data = resp_user.json().get('data', {}) if resp_user.status_code == 200 else {}
+            eh_gestor = user_data.get('eh_gestor', False)
+
+            # Define o status inicial dinamicamente
+            status_inicial = "pendente"
+            if exige_aprovacao and not eh_gestor:
+                status_inicial = "aguardando_aprovacao"
+            
+            logger.info(f"Processando envio. Org:{pedido.organization_id} Exige:{exige_aprovacao} Gestor:{eh_gestor} -> Status:{status_inicial}")
+
+            # 2. CRIAÇÃO DO LOTE
             nome_lote = f"Envio Portal - {len(pedido.itens)} itens"
             lote_payload = {
                 "nome_lote": nome_lote,
-                "status": "pendente", 
+                "status": status_inicial, # Status dinâmico
                 "quantidade_total": sum(i.quantidade for i in pedido.itens),
                 "organization_id": pedido.organization_id,
                 "user_created": pedido.user_id,
@@ -165,16 +183,22 @@ async def finalizar_envio(pedido: PedidoRequest):
             
             novo_lote_id = resp_lote.json().get('data', {}).get('id')
             
+            # 3. PROCESSAMENTO DOS ITENS
             for item in pedido.itens:
-                await baixar_estoque_seguro(item, client, headers)
-                itens_processados_com_sucesso.append(item)
+                # LÓGICA DE BAIXA CONDICIONAL
+                # Só baixa o estoque AGORA se o status for "pendente" (aprovado/direto).
+                # Se for "aguardando_aprovacao", a baixa será feita posteriormente pelo Gestor.
+                if status_inicial == "pendente":
+                    await baixar_estoque_seguro(item, client, headers)
+                    itens_processados_com_sucesso.append(item)
                 
+                # Monta a observação com a TAG crucial para o sistema de aprovação saber qual estoque baixar depois
                 obs = f"[REF_LOTE:{item.estoque_pai_id}|{item.lote_estoque_id or 0}]"
                 if item.lote_descricao: obs += f" [{item.lote_descricao}]"
 
                 solic_payload = {
                     "tipo": "SOLICITACAO_ENVIO",
-                    "status": "pendente",
+                    "status": status_inicial, # Acompanha o status do lote
                     "lote_id": novo_lote_id,
                     "organization_id": pedido.organization_id,
                     "produto_id": item.produto_id,
@@ -189,9 +213,15 @@ async def finalizar_envio(pedido: PedidoRequest):
                     logger.error(f"Erro ao criar solicitação para produto {item.produto_id}: {resp_solic.text}")
                     raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Falha ao criar solicitação para o produto {item.produto_id}.")
             
-            return {"status": "success", "lote_id": novo_lote_id, "message": "Pedido e baixas de estoque finalizados com sucesso."}
+            # Retorno condicional para o frontend
+            msg_final = "Pedido finalizado com sucesso."
+            if status_inicial == "aguardando_aprovacao":
+                msg_final = "Pedido criado e aguardando aprovação do gestor."
+
+            return {"status": "success", "lote_id": novo_lote_id, "message": msg_final, "estado_final": status_inicial}
 
         except HTTPException as he:
+            # Rollback só executa se houve baixa de estoque (itens processados)
             if itens_processados_com_sucesso:
                 logger.warning(f"Executando rollback após falha de HTTP: {he.detail}")
                 for item in itens_processados_com_sucesso:
@@ -205,7 +235,7 @@ async def finalizar_envio(pedido: PedidoRequest):
                     await restaurar_estoque(item, client, headers)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Erro interno no processamento do pedido: {str(e)}")
 
-# --- LEGADO: NORMALIZADOR ---
+# --- LEGADO: NORMALIZADOR (Mantido inalterado) ---
 def extrair_cep_bruto(texto: Any) -> Optional[str]:
     if not isinstance(texto, str): return None
     texto = texto.upper().replace('"', '').replace("'", "").strip()
@@ -306,7 +336,7 @@ async def preview_importacao(mapa: str = Form(...), file: UploadFile = File(...)
         logger.error(f"Erro ao gerar preview de importação: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Erro ao processar a importação: {str(e)}")
 
-# INICIALIZAÇÃO PROGRAMÁTICA (Necessária se for rodar via python main.py no Docker)
+# INICIALIZAÇÃO PROGRAMÁTICA
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
